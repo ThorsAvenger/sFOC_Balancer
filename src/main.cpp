@@ -1,14 +1,13 @@
 #include <SimpleFOC.h>
 
 #include "balancer_pinouts.h"
-#include "imu_helpers.h"
+// #include "imu_helpers.h"
+#include "ESP_NOW_helper.h"
+ 
 
-// serial instance for bluetooth communication
-// ESP32 bluetooth serial
-#include "BluetoothSerial.h"
-BluetoothSerial bluetooth;
-// bluetooth nucleo stm32
-// HardwareSerial bluetooth(PA12, PA11);
+
+
+
 
 // create motor and driver instances
 BLDCMotor motor1 = BLDCMotor(11); // left
@@ -16,25 +15,48 @@ BLDCMotor motor2 = BLDCMotor(11); // right
 BLDCDriver3PWM driver1 = BLDCDriver3PWM(MOT1_A, MOT1_B, MOT1_C, MOT1_EN);
 BLDCDriver3PWM driver2 = BLDCDriver3PWM(MOT2_A, MOT2_B, MOT2_C, MOT2_EN);
 
-MagneticSensorSPI sensor1 = MagneticSensorSPI(AS5147_SPI, 17);
-MagneticSensorSPI sensor2 = MagneticSensorSPI(AS5147_SPI, 5);
+MagneticSensorSPI sensor1 = MagneticSensorSPI(AS5147_SPI, 21);
+MagneticSensorSPI sensor2 = MagneticSensorSPI(AS5147_SPI, 14); // zero for the left leg and 1 for the right leg
 
 // imu spi pin 4
+int intFlag = 0;
+int initFOC_ready = 1; 
+float pitch = 0;
+float vel = 0;
+int dir = 0;
+int timeout = 0;
 
+struct_velocity data_vel;
+struct_mot_data data_out;
+
+// hw_timer_t *My_timer = NULL;
+// void IRAM_ATTR onTimer() {
+//   intFlag = 1;
+  // mpu6050.update();
+  // float angle = 5;//mpu6050.getAngleX();  // mpu.readAngleDegree();
+  // Serial.printf("Angle, %.2f\r\n", angle);
+  // NowSerial.printf("Angle, %.2f\r\n", angle);  // print some text to the serial consol.
+  // NowSerial.println(angle);    // read the angle value from the AS5047P sensor an print it to the serial consol.
+// }
+
+void IRAM_ATTR isr() {
+  Serial.println("Reset detected");
+  ESP.restart();
+}
 
 
 // control algorithm parameters
 // stabilisation pid
-PIDController pid_stb = PIDController(25, 100, 1, 100000, 4); 
+PIDController pid_stb = PIDController(50.0, 100, 1, 100000, 4); 
 // pid_stb.P = 30;
 // pid_stb.I = 100;
 // pid_stb.D = 1;
 // pid_stb.ramp = 100000;
 // pid_stb.limit = 7;
 // velocity pid
-PIDController pid_vel = PIDController(0.01, 0.03, 0, 10000, _PI*0.1);
+PIDController pid_vel = PIDController(0.005, 0.01, 0, 1000, _PI*0.1);
 // velocity control filtering
-LowPassFilter lpf_pitch_cmd = LowPassFilter(0.07);
+LowPassFilter lpf_pitch_cmd = LowPassFilter(0.5);
 // low pass filters for user commands - throttle and steering
 LowPassFilter lpf_throttle = LowPassFilter(0.5);
 LowPassFilter lpf_steering = LowPassFilter(0.1);
@@ -62,26 +84,40 @@ void setup() {
   // use monitoring with Serial for motor init
   // monitoring port
   Serial.begin(250000);
-  // bluetooth esp32
-  bluetooth.begin("FOCBalancer_esp");
-  // bluetooth nucleo
-  //  bluetooth.begin(115200);
+  
+  attachInterrupt(9, isr, FALLING);
+  digitalWrite(21, HIGH);
+  digitalWrite(14, HIGH);
+  // SimpleFOCDebug::enable(&Serial);
 
   _delay(1000);
+  WiFi.mode(WIFI_STA);
+  Serial.print("MAC address: ");
+  Serial.println(WiFi.macAddress());
   // imu init and configure
-  if ( !initIMU() ) {
-    Serial.println(F("IMU connection problem... Disabling!"));
-    bluetooth.println(F("IMU connection problem... Disabling!"));
-    return;
-  }
-  _delay(1000);
+//   if ( !initIMU() ) {
+//     Serial.println(F("IMU connection problem... Disabling!"));
+//  //   NowSerial.println(F("IMU connection problem... Disabling!"));
+//     return;
+//   }
+//   _delay(1000);
 
   // initialise encoder hardware
+  if(WiFi.macAddress() == "E4:B0:63:43:38:88") { 
+    Serial.println("Right leg");
+    dir = 0;
+  } else if(WiFi.macAddress() == "E4:B0:63:43:40:88") {
+    Serial.println("Left leg");
+    dir = 1;
+  } else {
+    Serial.println("Unknown leg");
+
+  }
 
   sensor1.init();
- 
+  Serial.println(dir);
   // encoder1.enableInterrupts(doA1, doB1);
-  sensor2.init();
+  sensor2.init(dir);
   // encoder2.enableInterrupts(doA2, doB2);
 
 
@@ -90,18 +126,27 @@ void setup() {
   motor2.linkSensor(&sensor2);
 
   // power supply voltage [V]
+  driver1.pwm_frequency = 20000;
   driver1.voltage_power_supply = 12;
-  
-  driver1.init();
+  if(!driver1.init()) {
+    Serial.println("Driver 1 init failed");
+    while(1);
+  }
   motor1.linkDriver(&driver1);
+  driver2.pwm_frequency = 20000;
   driver2.voltage_power_supply = 12;
-  driver2.init();
+  if(!driver2.init()) {
+    Serial.println("Driver 2 init failed");
+    while(1);
+  }
   motor2.linkDriver(&driver2);
 
   // set control loop type to be used
   // using voltage torque mode 
   motor1.voltage_sensor_align = 2; 
   motor2.voltage_sensor_align = 2;
+  motor1.LPF_velocity.Tf = 0.01; // 10ms low pass filter time constant, default 5ms
+  motor2.LPF_velocity.Tf = 0.075; // 75ms low pass filter time constant, default 5ms
   motor1.foc_modulation = FOCModulationType::SpaceVectorPWM;
   motor1.controller = MotionControlType::torque;
   motor2.foc_modulation = FOCModulationType::SpaceVectorPWM;
@@ -109,30 +154,33 @@ void setup() {
 
 
   // enable monitoring
-  motor1.useMonitoring(Serial);
-  motor2.useMonitoring(Serial);
+  // motor1.useMonitoring(Serial);
+  // motor2.useMonitoring(Serial);
 
   // initialise motor
 
   motor1.init();
-  // MOT: Zero elec. angle: 0.69
   motor2.init();
+  
   // MOT: Zero elec. angle: 4.96
   // motor1.sensor_direction = CW;
   // motor1.zero_electric_angle = 2.23;
-  // motor2.sensor_direction = CCW;
-  // motor2.zero_electric_angle = 2.33;
+  // motor2.sensor_direction = CW;
+  // motor2.zero_electric_angle = 4.60;
     // align encoder and start FOC
   Serial.println("Init motor 1 (left)");
-  motor1.initFOC();
+  initFOC_ready = motor1.initFOC(); 
   Serial.println("Init motor 2 (right)");
-  motor2.initFOC();
+  initFOC_ready = motor2.initFOC();
   
-
+  if(!initFOC_ready){
+    Serial.println("Init FOC failed");
+    // while(1);
+  }
   // motor1.target = 2;
   // motor2.target = 2;
 
-  Serial.println(motor1.sensor_direction);
+  // Serial.println(motor1.sensor_direction);
   delay(1000);
 
   // add the configuration commands
@@ -143,50 +191,72 @@ void setup() {
   commander.add('E', lpfSteering, "lpf steering");
 
   Serial.println(F("Balancing robot ready!"));
-  bluetooth.println(F("Balancing robot ready!"));
+  // NowSerial.println(F("Balancing robot ready!"));
+  espNowInit();
+  timeout = millis();
 }
 
 
 void loop() {
   // iterative setting FOC phase voltage
-  motor1.loopFOC();
+  // motor1.loopFOC();
   motor2.loopFOC();
   
   
 
   // iterative function setting the outter loop target
-  motor1.move();
+  // motor1.move();
   motor2.move();
   // Serial.printf("State: %i\n\r", state);
-  if (!state) { // if balancer disabled
-    motor1.target = 0;
+  if (!state || (millis() - timeout > 1000)) { // if balancer disabled
+    // motor1.target = 0;
     motor2.target = 0;
-  } else if ( hasDataIMU() ) { // when IMU has received the package
+  // } else if ( hasDataIMU() ) { // when IMU has received the package
+  }  if (msgData()) {
+      // msgFlag = 0;
     // read pitch from the IMU
-    // Serial.printf("a1: %.2f, a2: %.2f", sensor1.getAngle(), sensor2.getAngle()); 
-    float pitch = getPitchIMU();
+    // float pitch = getPitchIMU();
+
+    data_vel = getMsg();
+    pitch = data_vel.vel_L;
+    vel = data_vel.vel_R;
+    timeout = millis();
+    // pitch = getPitchMsg(); 
+  } else {
+    return;
+  }
+
     // Serial.printf("\tPitch: %.2f\t", pitch);
     // calculate the target angle for throttle control
-    float target_pitch = lpf_pitch_cmd(pid_vel((motor1.shaft_velocity + motor2.shaft_velocity) / 2 - lpf_throttle(throttle)));
-    // float target_pitch = lpf_pitch_cmd(pid_vel((motor1.shaft_velocity + motor2.shaft_velocity) / 2));
+    // float target_pitch = lpf_pitch_cmd(pid_vel((motor1.shaft_velocity + motor2.shaft_velocity) / 2 - lpf_throttle(throttle)));
+    // float target_pitch = lpf_pitch_cmd(pid_vel(-motor2.shaft_velocity - lpf_throttle(throttle)));
+    float target_pitch = lpf_pitch_cmd(pid_vel(vel/2 - lpf_throttle(throttle)));
     // calculate the target voltage
-    float voltage_control = pid_stb(target_pitch - pitch);
+    float voltage_control = pid_stb(target_pitch+pitch);//
     
     // filter steering
     float steering_adj = lpf_steering(steering);
     // set the tergat voltage value 
-    motor1.target = voltage_control; // + steering_adj;
+    // motor1.target = voltage_control; // + steering_adj;
     motor2.target = voltage_control; // - steering_adj;
-    if(itter++ % 50 == 0){
-      Serial.printf("a1: %.2f, a2: %.2f\tPitch: %.2f\tTarget Voltage: %.2f\tTarget pitch: %.2f\n\r", sensor1.getAngle(), sensor2.getAngle(), pitch, voltage_control, target_pitch);
-    }
-  }
+ 
+    // if( itter++ % 100 == 0){
+
+      // Serial.printf("as2: %.2f,a2: %.2f, shaft_vel: %.2f, sensor_vel: %.2f \t\tPitch: %.2f\tTarget Voltage: %.2f\tTarget pitch: %.2f\n\r"
+      //   ,motor2.shaft_angle, sensor2.getAngle(), motor2.shaft_velocity,sensor2.getVelocity(), pitch, voltage_control, target_pitch-pitch);
+        // itter = 0;
+        data_out.voltage = motor2.shaft_velocity;//voltage_control; 
+        data_out.pitch = target_pitch+pitch;
+        data_out.m_id = dir;
+        sendMotorData(data_out);
+      // }
+  // }
 
 
   // read the tuning commands from Serial
   commander.run();
   // read the user command from bluetooth
-  handleBluetooth(bluetooth);
+  // handleBluetooth(bluetooth);
 }
 
 /**

@@ -16,7 +16,9 @@
 			"string_view": "cpp",
 			"initializer_list": "cpp",
 			"span": "cpp",
-			"cmath": "cpp"
+			"cmath": "cpp",
+			"*.tcc": "cpp",
+			"functional": "cpp"
 		}
 	}
 }
