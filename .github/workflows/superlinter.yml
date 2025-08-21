@@ -6,6 +6,9 @@ jobs:
   super-lint:
     name: Lint code based
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # Grants the token write access to repository contents
+      statuses: write # Grants the token write access to commit statuses
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
